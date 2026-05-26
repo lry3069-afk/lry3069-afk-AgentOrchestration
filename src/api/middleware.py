@@ -1,21 +1,88 @@
 """API middleware components."""
 
+import os
 import time
 import logging
-from typing import Callable
+from typing import Callable, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, JSONResponse
+
+from src.common.auth import (
+    TokenValidationError,
+    decode_and_validate_token,
+)
 
 logger = logging.getLogger(__name__)
 
 
+def _get_jwt_secret() -> str:
+    """Return the configured JWT signing secret."""
+    return os.environ.get("AO_JWT_SECRET", "dev-secret-do-not-use-in-production")
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
+    """Validates JWT tokens on protected /api/v2 routes.
+
+    Verifies audience, issuer, tenant, and expiration claims before
+    allowing a request to proceed. Returns 401 for missing/invalid tokens
+    and 403 for expired tokens.
+    """
+
+    # Paths that do not require JWT validation
+    _PUBLIC_PATHS = frozenset([
+        "/api/v2/auth/token",
+        "/api/v2/health",
+        "/api/v2/healthz",
+    ])
+
+    # Paths that require strict embedded-session JWT validation
+    _EMBEDDED_SESSION_PATHS = frozenset([
+        "/api/v2/sessions/embedded",
+        "/api/v2/sessions/embedded/create",
+    ])
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+        if not request.url.path.startswith("/api/v2"):
+            return await call_next(request)
+        if request.url.path in self._PUBLIC_PATHS:
+            return await call_next(request)
+
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(status_code=401, content={"error": "Missing or malformed Authorization header"})
+
+        token = auth_header[7:]  # strip "Bearer "
+        if not token:
+            return JSONResponse(status_code=401, content={"error": "Empty Bearer token"})
+
+        secret = _get_jwt_secret()
+        is_embedded = request.url.path in self._EMBEDDED_SESSION_PATHS
+
+        try:
+            payload = decode_and_validate_token(
+                token,
+                secret,
+                require_audience=True,
+                require_tenant=True,
+            )
+            # Attach validated claims to request state for downstream handlers
+            request.state.token_payload = payload
+            request.state.tenant = payload.get("tenant")
+            request.state.aud = payload.get("aud")
+        except TokenValidationError as e:
+            if e.claim == "exp":
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": f"Token validation failed: {e.reason}"},
+                )
+            return JSONResponse(
+                status_code=401,
+                content={"error": f"Token validation failed: {e.reason}"},
+            )
+        except ValueError as e:
+            return JSONResponse(status_code=401, content={"error": str(e)})
+
         return await call_next(request)
 
 

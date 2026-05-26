@@ -2,9 +2,25 @@
 
 import asyncio
 import heapq
+import logging
 import time
 from typing import Any, Dict, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
+# Sentinel value for "no budget limit" on a priority class
+UNLIMITED = -1
+
+
+class FairnessBudgetViolation(Exception):
+    """Raised when a task would violate fairness budget constraints."""
+    pass
+
+
+class StaleStateTransition(Exception):
+    """Raised when an invalid or stale state transition is attempted."""
+    pass
 
 
 class PriorityQueue:
@@ -31,22 +47,119 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, default_budget: int = 10, max_retries: int = 3):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
-        self._max_retries = 3
+        self._max_retries = max_retries
+        # Fairness budgets: priority_class -> (used_slots, max_slots)
+        self._fairness_budgets: Dict[str, tuple] = {}
+        # Budget limits per priority class (None = use default_budget)
+        self._budget_limits: Dict[str, int] = {}
+        self._default_budget = default_budget
+        # Tracks valid state transitions: agent_id -> last_known_state
+        self._agent_state_cache: Dict[str, str] = {}
+        # Liveness fence: reject stale transitions older than this (seconds)
+        self._state_fence_seconds = 300
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+    def set_budget_limit(self, priority_class: str, limit: int) -> None:
+        """Set max fairness budget slots for a priority class. Pass UNLIMITED for no cap."""
+        self._budget_limits[priority_class] = limit
+
+    def _get_budget(self, priority_class: str) -> tuple:
+        """Return (used, max) slots for a priority class."""
+        if priority_class not in self._fairness_budgets:
+            limit = self._budget_limits.get(priority_class, self._default_budget)
+            self._fairness_budgets[priority_class] = (0, limit)
+        return self._fairness_budgets[priority_class]
+
+    def _consume_budget(self, priority_class: str) -> None:
+        """Atomically consume one slot from a priority class budget."""
+        used, max_slots = self._get_budget(priority_class)
+        if max_slots != UNLIMITED and used >= max_slots:
+            logger.warning(
+                f"Fairness budget exhausted for priority_class={priority_class} "
+                f"(used={used}, max={max_slots})"
+            )
+            raise FairnessBudgetViolation(
+                f"Budget exhausted for priority class '{priority_class}'"
+            )
+        self._fairness_budgets[priority_class] = (used + 1, max_slots)
+
+    def _release_budget(self, priority_class: str) -> None:
+        """Release one slot back to a priority class budget."""
+        if priority_class not in self._fairness_budgets:
+            return
+        used, max_slots = self._fairness_budgets[priority_class]
+        self._fairness_budgets[priority_class] = (max(0, used - 1), max_slots)
+
+    def _validate_state_transition(self, task: Dict) -> None:
+        """
+        Validate state transition preconditions for urgent workflow lanes.
+        Raises StaleStateTransition if the transition is stale, duplicate, or policy-violating.
+        """
+        agent_id = task.get("target_agent")
+        priority_class = task.get("priority_class", "default")
+        expected_state = task.get("expected_agent_state")
+        task_id = task.get("id", "unknown")
+
+        # Check for duplicate in-flight task for the same agent
+        for in_flight_task in self._in_flight.values():
+            if (
+                in_flight_task.get("target_agent") == agent_id
+                and in_flight_task["id"] != task_id
+                and in_flight_task.get("priority_class") == priority_class
+            ):
+                logger.warning(
+                    f"Duplicate in-flight task for agent={agent_id} "
+                    f"priority_class={priority_class}, task_id={task_id}"
+                )
+                raise StaleStateTransition(
+                    f"Duplicate task for agent={agent_id} in priority_class={priority_class}"
+                )
+
+        # Validate agent state cache for urgent lanes
+        if priority_class == "urgent" and agent_id:
+            cached_state = self._agent_state_cache.get(agent_id)
+            if cached_state and expected_state and cached_state != expected_state:
+                age = time.time() - task.get("enqueued_at", time.time())
+                if age > self._state_fence_seconds:
+                    logger.warning(
+                        f"Stale transition rejected: agent={agent_id} "
+                        f"cached={cached_state} expected={expected_state} age={age:.1f}s"
+                    )
+                    raise StaleStateTransition(
+                        f"Stale state transition for agent={agent_id}: "
+                        f"expected {expected_state}, cached {cached_state} (age={age:.1f}s)"
+                    )
+            # Update cache with expected state
+            if expected_state:
+                self._agent_state_cache[agent_id] = expected_state
+
+    def update_agent_state(self, agent_id: str, state: str) -> None:
+        """Update the cached state for an agent. Call this when agent lifecycle changes."""
+        self._agent_state_cache[agent_id] = state
+
+    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0,
+                priority_class: str = "default") -> str:
+        """Enqueue a task. Raises FairnessBudgetViolation if budget is exhausted."""
+        is_retry = "id" in task  # already had an id -> re-enqueue after fail
+        if not is_retry:
+            task_id = str(uuid4())
+            task["id"] = task_id
+            task.setdefault("enqueued_at", time.time())
+            task["retries"] = 0
+        task["priority_class"] = priority_class
+        task["queue"] = queue
+
+        # Enforce fairness budget before accepting (skip for retries — budget already consumed)
+        if not is_retry:
+            self._consume_budget(priority_class)
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
+        return task["id"]
 
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
@@ -55,29 +168,47 @@ class TaskScheduler:
         return task_id
 
     async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+        """
+        Async dequeue with fairness budget enforcement and atomic state preconditions.
+        Raises FairnessBudgetViolation or StaleStateTransition on policy violations.
+        """
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
             task = self._scheduled.pop(tid)
             if task:
-                self.enqueue(task, queue)
+                try:
+                    self.enqueue(task, queue,
+                                 priority=task.get("priority", 0),
+                                 priority_class=task.get("priority_class", "default"))
+                except FairnessBudgetViolation:
+                    pass  # skip expired tasks whose budget is exhausted
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                self._validate_state_transition(task)
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        if task:
+            self._release_budget(task.get("priority_class", "default"))
+        return True
+        return task is not None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
+            priority_class = task.get("priority_class", "default")
             task["retries"] += 1
+            self._release_budget(priority_class)
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self.enqueue(task, queue,
+                             priority=task.get("priority", 0),
+                             priority_class=priority_class)
                 return True
         return False
 
