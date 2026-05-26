@@ -5,6 +5,7 @@ import os
 from typing import Any, Dict, List, Optional
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+from json import JSONDecodeError
 
 
 class OrchestratorClient:
@@ -24,9 +25,14 @@ class OrchestratorClient:
 
         try:
             with urlopen(req) as resp:
-                return json.loads(resp.read().decode())
+                raw = resp.read()
+                if resp.status == 204 or not raw:
+                    return {}
+                return json.loads(raw.decode())
         except HTTPError as e:
             return {"error": e.code, "message": e.reason}
+        except JSONDecodeError as e:
+            return {"error": -1, "message": f"JSON decode error: {e}"}
 
     def register_agent(self, name: str, agent_type: str, config: Dict = None) -> Dict:
         return self._request("POST", "/agents", {
