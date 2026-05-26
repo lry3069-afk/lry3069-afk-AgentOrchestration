@@ -5,48 +5,111 @@ from src.agent.registry import AgentRegistry, AgentStatus
 class TestAgentRegistry:
     def setup_method(self):
         self.registry = AgentRegistry()
+        self.tenant_a = "tenant-a"
+        self.tenant_b = "tenant-b"
+
+    def test_register_agent_requires_tenant_id(self):
+        with pytest.raises(ValueError, match="tenant_id is required"):
+            self.registry.register("test-agent", "worker.processor", "")
 
     def test_register_agent(self):
-        agent_id = self.registry.register("test-agent", "worker.processor")
+        agent_id = self.registry.register("test-agent", "worker.processor", self.tenant_a)
         assert agent_id is not None
         assert self.registry.count() == 1
+        assert self.registry.count(self.tenant_a) == 1
 
-    def test_get_agent(self):
-        agent_id = self.registry.register("test-agent", "worker.processor")
-        agent = self.registry.get(agent_id)
+    def test_get_agent_scoped_to_tenant(self):
+        agent_id = self.registry.register("test-agent", "worker.processor", self.tenant_a)
+        # Correct tenant can access
+        agent = self.registry.get(agent_id, tenant_id=self.tenant_a)
         assert agent is not None
         assert agent["name"] == "test-agent"
         assert agent["type"] == "worker.processor"
+        assert agent["tenant_id"] == self.tenant_a
+        # Wrong tenant cannot access
+        agent = self.registry.get(agent_id, tenant_id=self.tenant_b)
+        assert agent is None
 
     def test_get_nonexistent_agent(self):
-        agent = self.registry.get("nonexistent-id")
+        agent = self.registry.get("nonexistent-id", tenant_id=self.tenant_a)
         assert agent is None
 
     def test_list_agents(self):
-        self.registry.register("agent-1", "worker.processor")
-        self.registry.register("agent-2", "worker.analyzer")
-        self.registry.register("agent-3", "monitor.watcher")
+        self.registry.register("agent-1", "worker.processor", self.tenant_a)
+        self.registry.register("agent-2", "worker.analyzer", self.tenant_a)
+        self.registry.register("agent-3", "monitor.watcher", self.tenant_b)
         assert len(self.registry.list()) == 3
+        assert len(self.registry.list(tenant_id=self.tenant_a)) == 2
+        assert len(self.registry.list(tenant_id=self.tenant_b)) == 1
 
-    def test_list_agents_by_group(self):
-        self.registry.register("agent-1", "worker.processor")
-        self.registry.register("agent-2", "monitor.watcher")
-        workers = self.registry.list(group="worker")
-        assert len(workers) == 1
+    def test_list_agents_by_group_scoped_to_tenant(self):
+        self.registry.register("agent-1", "worker.processor", self.tenant_a)
+        self.registry.register("agent-2", "monitor.watcher", self.tenant_a)
+        self.registry.register("agent-3", "worker.processor", self.tenant_b)
+        # tenant-a has 1 worker
+        workers_a = self.registry.list(group="worker", tenant_id=self.tenant_a)
+        assert len(workers_a) == 1
+        # tenant-b has 1 worker
+        workers_b = self.registry.list(group="worker", tenant_id=self.tenant_b)
+        assert len(workers_b) == 1
 
-    def test_update_status(self):
-        agent_id = self.registry.register("test-agent", "worker.processor")
-        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
-        agent = self.registry.get(agent_id)
+    def test_update_status_scoped_to_tenant(self):
+        agent_id = self.registry.register("test-agent", "worker.processor", self.tenant_a)
+        # Correct tenant can update
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING, tenant_id=self.tenant_a)
+        agent = self.registry.get(agent_id, tenant_id=self.tenant_a)
         assert agent["status"] == "running"
+        # Wrong tenant cannot update
+        assert not self.registry.update_status(agent_id, AgentStatus.FAILED, tenant_id=self.tenant_b)
 
-    def test_delete_agent(self):
-        agent_id = self.registry.register("test-agent", "worker.processor")
-        assert self.registry.delete(agent_id)
+    def test_delete_agent_scoped_to_tenant(self):
+        agent_id = self.registry.register("test-agent", "worker.processor", self.tenant_a)
+        # Wrong tenant cannot delete
+        assert not self.registry.delete(agent_id, tenant_id=self.tenant_b)
+        assert self.registry.count(self.tenant_a) == 1
+        # Correct tenant can delete
+        assert self.registry.delete(agent_id, tenant_id=self.tenant_a)
         assert self.registry.count() == 0
 
     def test_delete_nonexistent_agent(self):
-        assert not self.registry.delete("nonexistent-id")
+        assert not self.registry.delete("nonexistent-id", tenant_id=self.tenant_a)
+
+    def test_cross_tenant_isolation(self):
+        """Regression: tenant-a agents must not be visible to tenant-b."""
+        a1 = self.registry.register("a-worker", "worker.processor", self.tenant_a)
+        a2 = self.registry.register("b-worker", "worker.processor", self.tenant_b)
+        # Each tenant only sees its own agents
+        assert len(self.registry.list(tenant_id=self.tenant_a)) == 1
+        assert len(self.registry.list(tenant_id=self.tenant_b)) == 1
+        # Cross-tenant get returns None
+        assert self.registry.get(a1, tenant_id=self.tenant_b) is None
+        assert self.registry.get(a2, tenant_id=self.tenant_a) is None
+
+    def test_resolve_agents_scoped_to_tenant(self):
+        self.registry.register("agent-1", "worker.processor", self.tenant_a)
+        self.registry.register("agent-2", "worker.processor", self.tenant_b)
+        self.registry.register("agent-3", "monitor.watcher", self.tenant_a)
+        # Resolve workers for tenant-a only
+        workers_a = self.registry.resolve(agent_type="worker.processor", tenant_id=self.tenant_a)
+        assert len(workers_a) == 1
+        assert workers_a[0]["tenant_id"] == self.tenant_a
+
+
+class TestAgentRegistryNoTenantBackwards:
+    """Backwards-compat: operations without tenant_id work for existing agents."""
+    def setup_method(self):
+        self.registry = AgentRegistry()
+
+    def test_register_still_requires_tenant_id(self):
+        with pytest.raises(ValueError):
+            self.registry.register("test", "worker.processor", "")
+
+    def test_register_and_get_without_tenant_param(self):
+        """get() without tenant_id still returns the agent (no cross-tenant check)."""
+        agent_id = self.registry.register("test-agent", "worker.processor", "default-tenant")
+        # Passing no tenant_id param falls back to allowing access
+        agent = self.registry.get(agent_id)
+        assert agent is not None
 
 # 2019-01-23T10:28:57 update
 
