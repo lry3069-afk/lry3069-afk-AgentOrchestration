@@ -1,9 +1,10 @@
-"""API route definitions."""
+"""API route definitions with idempotency key support for destructive actions."""
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Header
 from typing import List, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.idempotency import get_global_store
 
 router = APIRouter()
 registry = AgentRegistry()
@@ -30,24 +31,75 @@ async def get_agent(agent_id: str):
 
 
 @router.delete("/agents/{agent_id}")
-async def delete_agent(agent_id: str):
-    if not registry.delete(agent_id):
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return {"status": "deleted"}
+async def delete_agent(
+    agent_id: str,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    """Delete an agent. Supports Idempotency-Key to safely handle retries."""
+    def _do_delete():
+        if not registry.delete(agent_id):
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return {"status": "deleted", "agent_id": agent_id}
+
+    if idempotency_key:
+        store = get_global_store()
+        result, cached = store.get_or_execute(idempotency_key, _do_delete)
+        return result
+    return _do_delete()
 
 
 @router.post("/agents/{agent_id}/start")
-async def start_agent(agent_id: str):
-    if not registry.update_status(agent_id, AgentStatus.RUNNING):
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return {"status": "started"}
+async def start_agent(
+    agent_id: str,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    """Start an agent. Supports Idempotency-Key to safely handle retries."""
+    def _do_start():
+        if not registry.update_status(agent_id, AgentStatus.RUNNING):
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return {"status": "started", "agent_id": agent_id}
+
+    if idempotency_key:
+        store = get_global_store()
+        result, cached = store.get_or_execute(idempotency_key, _do_start)
+        return result
+    return _do_start()
 
 
 @router.post("/agents/{agent_id}/stop")
-async def stop_agent(agent_id: str):
-    if not registry.update_status(agent_id, AgentStatus.PAUSED):
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return {"status": "stopped"}
+async def stop_agent(
+    agent_id: str,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    """Stop an agent. Supports Idempotency-Key to safely handle retries."""
+    def _do_stop():
+        if not registry.update_status(agent_id, AgentStatus.PAUSED):
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return {"status": "stopped", "agent_id": agent_id}
+
+    if idempotency_key:
+        store = get_global_store()
+        result, cached = store.get_or_execute(idempotency_key, _do_stop)
+        return result
+    return _do_stop()
+
+
+@router.post("/agents/{agent_id}/revoke")
+async def revoke_agent(
+    agent_id: str,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    """Revoke an agent registration. Supports Idempotency-Key to safely handle retries."""
+    def _do_revoke():
+        if not registry.delete(agent_id):
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return {"status": "revoked", "agent_id": agent_id}
+
+    if idempotency_key:
+        store = get_global_store()
+        result, cached = store.get_or_execute(idempotency_key, _do_revoke)
+        return result
+    return _do_revoke()
 
 
 @router.get("/agents/count")
@@ -70,7 +122,7 @@ async def agent_count():
 
 # 2019-08-06T17:13:22 update
 
-# 2019-09-26T19:27:40 update
+# 2019-09-26T19:27:09 update
 
 # 2019-11-08T15:48:07 update
 
@@ -86,7 +138,7 @@ async def agent_count():
 
 # 2020-08-14T20:37:18 update
 
-# 2020-11-05T16:47:32 update
+# 2020-11-05T16:47:05 update
 
 # 2021-03-11T12:52:51 update
 
@@ -96,7 +148,7 @@ async def agent_count():
 
 # 2021-05-07T14:43:25 update
 
-# 2021-05-12T12:11:05 update
+# 2021-05-12T12:11:19 update
 
 # 2021-05-26T19:45:39 update
 
@@ -112,7 +164,7 @@ async def agent_count():
 
 # 2021-11-01T20:50:23 update
 
-# 2022-02-04T09:23:08 update
+# 2022-02-04T09:23:06 update
 
 # 2022-02-14T15:58:17 update
 
@@ -124,13 +176,13 @@ async def agent_count():
 
 # 2022-07-31T11:24:57 update
 
-# 2022-08-09T15:47:57 update
+# 2022-08-09T15:47:22 update
 
 # 2022-08-19T12:51:59 update
 
 # 2022-11-02T08:06:45 update
 
-# 2022-11-21T14:12:56 update
+# 2022-11-21T14:12:55 update
 
 # 2023-01-13T12:25:51 update
 
@@ -191,3 +243,5 @@ async def agent_count():
 # 2026-04-09T20:30:37 update
 
 # 2026-05-13T11:36:25 update
+
+# 2026-05-26T06:00:00 update  # Idempotency key support for destructive actions
