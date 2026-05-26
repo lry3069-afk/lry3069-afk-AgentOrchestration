@@ -1,9 +1,11 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Header, Request
 from typing import List, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.sessions import get_session_manager
+from src.common.auth import TokenValidationError
 
 router = APIRouter()
 registry = AgentRegistry()
@@ -53,6 +55,65 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+# --- Embedded console session routes ---
+
+
+@router.post("/sessions/embedded/create")
+async def create_embedded_session(
+    request: Request,
+    workspace: str,
+    token: str,
+    audience: Optional[str] = None,
+    issuer: Optional[str] = None,
+):
+    """Issue an embedded console session for a validated JWT.
+
+    Validates the provided JWT token (audience, issuer, tenant, expiration)
+    before minting a short-lived embedded session. Returns a session token
+    scoped to the authenticated tenant and workspace.
+    """
+    session_mgr = get_session_manager()
+    try:
+        session = session_mgr.create_session(
+            token=token,
+            secret=request.app.state.jwt_secret,
+            workspace=workspace,
+            require_tenant=True,
+        )
+        return {
+            "session_id": session.session_id,
+            "workspace": session.workspace,
+            "tenant": session.tenant,
+            "issuer": session.issuer,
+            "expires_at": session.expires_at,
+        }
+    except TokenValidationError as e:
+        raise HTTPException(status_code=401, detail=f"JWT validation failed: {e.reason}")
+
+
+@router.get("/sessions/embedded/{session_id}")
+async def get_embedded_session(session_id: str):
+    """Retrieve an active embedded session.
+
+    Returns session metadata if valid and not expired.
+    """
+    session_mgr = get_session_manager()
+    session = session_mgr.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    return session.to_dict()
+
+
+@router.delete("/sessions/embedded/{session_id}")
+async def revoke_embedded_session(session_id: str):
+    """Immediately revoke an embedded session."""
+    session_mgr = get_session_manager()
+    revoked = session_mgr.revoke_session(session_id)
+    if not revoked:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"status": "revoked", "session_id": session_id}
 
 # 2019-03-18T11:10:18 update
 
