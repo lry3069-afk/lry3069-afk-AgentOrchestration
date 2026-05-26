@@ -14,6 +14,18 @@ class AgentStatus(Enum):
     STOPPED = "stopped"
     FAILED = "failed"
     TERMINATED = "terminated"
+    DISABLED = "disabled"
+
+
+class DuplicateExternalIdError(ValueError):
+    """Raised when a service account external ID is already in use."""
+
+    def __init__(self, external_id: str, existing_agent_id: str):
+        super().__init__(
+            f"External ID '{external_id}' already in use by agent {existing_agent_id}"
+        )
+        self.external_id = external_id
+        self.existing_agent_id = existing_agent_id
 
 
 class AgentRegistry:
@@ -21,8 +33,85 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        # Maps external_id -> agent_id for active (non-disabled, non-terminated) accounts
+        self._external_id_index: Dict[str, str] = {}
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    # ------------------------------------------------------------------
+    # External ID uniqueness helpers  (Issue #4844)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_active(status: str) -> bool:
+        """An account is 'active' unless explicitly disabled or terminated."""
+        return status not in (
+            AgentStatus.DISABLED.value,
+            AgentStatus.TERMINATED.value,
+        )
+
+    def _check_external_id_uniqueness(
+        self,
+        external_id: Optional[str],
+        organization: str,
+        exclude_agent_id: Optional[str] = None,
+    ) -> None:
+        """Raise DuplicateExternalIdError if external_id is already in active use."""
+        if not external_id:
+            return
+
+        key = f"{organization}::{external_id}"
+        existing = self._external_id_index.get(key)
+        if existing is None:
+            return
+        if existing == exclude_agent_id:
+            return
+        # Verify the existing account is still active
+        if existing in self._agents:
+            if self._is_active(self._agents[existing]["status"]):
+                raise DuplicateExternalIdError(external_id, existing)
+        # Stale index entry — clean up
+        self._external_id_index.pop(key, None)
+
+    def _index_external_id(
+        self,
+        agent_id: str,
+        external_id: Optional[str],
+        organization: str,
+    ) -> None:
+        """Register the external_id -> agent_id mapping for active accounts."""
+        if not external_id:
+            return
+        key = f"{organization}::{external_id}"
+        self._external_id_index[key] = agent_id
+
+    def _unindex_external_id(self, agent_id: str) -> None:
+        """Remove all external_id mappings for a given agent_id."""
+        to_remove = [
+            k for k, v in self._external_id_index.items() if v == agent_id
+        ]
+        for k in to_remove:
+            self._external_id_index.pop(k, None)
+
+    # ------------------------------------------------------------------
+    # Core CRUD
+    # ------------------------------------------------------------------
+
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+        external_id: Optional[str] = None,
+        organization: str = "default",
+    ) -> str:
+        """Register a new agent (or service account).
+
+        For service accounts (`agent_type` starts with "service_account"),
+        `external_id` must be unique within the organization across all
+        active accounts.  Duplicate active external IDs are rejected.
+        """
+        # --- External ID uniqueness check ---
+        self._check_external_id_uniqueness(external_id, organization)
+
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -31,6 +120,8 @@ class AgentRegistry:
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
             "config": config or {},
+            "external_id": external_id,
+            "organization": organization,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -40,12 +131,20 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+
+        # Index external_id for active accounts
+        self._index_external_id(agent_id, external_id, organization)
+
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -57,9 +156,98 @@ class AgentRegistry:
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
         if agent_id not in self._agents:
             return False
+        old_status = self._agents[agent_id]["status"]
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+
+        # Maintain external_id index when transitioning between active/inactive
+        ext_id = self._agents[agent_id].get("external_id")
+        org = self._agents[agent_id].get("organization", "default")
+        was_active = self._is_active(old_status)
+        is_active = self._is_active(status.value)
+
+        if was_active and not is_active:
+            self._unindex_external_id(agent_id)
+        elif not was_active and is_active:
+            # Re-index — but check for conflicts first
+            self._check_external_id_uniqueness(ext_id, org, exclude_agent_id=agent_id)
+            self._index_external_id(agent_id, ext_id, org)
+
         return True
+
+    # ------------------------------------------------------------------
+    # Service account specific operations  (Issue #4844)
+    # ------------------------------------------------------------------
+
+    def update_service_account(
+        self,
+        agent_id: str,
+        name: Optional[str] = None,
+        external_id: Optional[str] = None,
+        config: Optional[Dict] = None,
+    ) -> bool:
+        """Update a service account's metadata.
+
+        Changing external_id triggers uniqueness validation — the new
+        value must not collide with another active account in the same
+        organization.
+        """
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            return False
+
+        org = agent.get("organization", "default")
+        old_ext_id = agent.get("external_id")
+
+        if external_id is not None and external_id != old_ext_id:
+            self._check_external_id_uniqueness(external_id, org, exclude_agent_id=agent_id)
+            agent["external_id"] = external_id
+            # Update index
+            if self._is_active(agent["status"]):
+                self._unindex_external_id(agent_id)
+                self._index_external_id(agent_id, external_id, org)
+
+        if name is not None:
+            agent["name"] = name
+        if config is not None:
+            agent["config"] = config
+
+        agent["updated_at"] = time.time()
+        return True
+
+    def disable(self, agent_id: str) -> bool:
+        """Disable a service account — releases the external_id for reuse."""
+        return self.update_status(agent_id, AgentStatus.DISABLED)
+
+    def restore(self, agent_id: str) -> bool:
+        """Restore a disabled service account.
+
+        The external_id is re-validated against active accounts.  If
+        another account has claimed the external_id in the meantime, the
+        restore is rejected.
+        """
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            return False
+        if agent["status"] != AgentStatus.DISABLED.value:
+            return False
+
+        ext_id = agent.get("external_id")
+        org = agent.get("organization", "default")
+        self._check_external_id_uniqueness(ext_id, org, exclude_agent_id=agent_id)
+        return self.update_status(agent_id, AgentStatus.PENDING)
+
+    def find_by_external_id(
+        self,
+        external_id: str,
+        organization: str = "default",
+    ) -> Optional[Dict[str, Any]]:
+        """Look up an active service account by its external ID."""
+        key = f"{organization}::{external_id}"
+        agent_id = self._external_id_index.get(key)
+        if agent_id is None:
+            return None
+        return self._agents.get(agent_id)
 
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
@@ -68,115 +256,11 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        # Clean up external_id index
+        self._unindex_external_id(agent_id)
         return True
 
     def count(self) -> int:
         return len(self._agents)
 
-# 2019-01-29T11:24:49 update
-
-# 2019-04-09T13:38:38 update
-
-# 2019-04-11T11:24:12 update
-
-# 2019-06-26T17:03:48 update
-
-# 2019-07-03T14:55:48 update
-
-# 2019-07-18T18:18:47 update
-
-# 2019-11-05T11:27:19 update
-
-# 2019-11-20T11:35:05 update
-
-# 2019-11-23T15:28:54 update
-
-# 2020-03-13T09:23:07 update
-
-# 2020-03-30T19:31:18 update
-
-# 2020-04-22T15:03:30 update
-
-# 2020-07-21T10:00:48 update
-
-# 2020-09-10T09:02:08 update
-
-# 2020-09-10T13:39:12 update
-
-# 2020-09-22T16:27:52 update
-
-# 2020-10-15T10:33:14 update
-
-# 2021-05-13T11:15:56 update
-
-# 2021-07-07T14:57:13 update
-
-# 2021-07-13T15:15:19 update
-
-# 2021-07-27T10:18:16 update
-
-# 2022-03-11T15:24:11 update
-
-# 2022-09-22T13:24:20 update
-
-# 2022-11-01T12:20:40 update
-
-# 2023-01-30T12:32:27 update
-
-# 2023-03-10T09:43:50 update
-
-# 2023-05-10T14:28:01 update
-
-# 2023-05-11T20:04:46 update
-
-# 2023-05-30T17:00:59 update
-
-# 2023-07-13T17:54:32 update
-
-# 2023-07-20T19:04:20 update
-
-# 2023-07-31T17:00:02 update
-
-# 2023-09-05T19:42:07 update
-
-# 2024-01-02T10:29:47 update
-
-# 2024-09-17T12:45:29 update
-
-# 2024-09-17T11:51:01 update
-
-# 2024-11-06T18:20:15 update
-
-# 2025-01-12T15:13:14 update
-
-# 2025-01-14T20:24:39 update
-
-# 2025-03-26T20:21:27 update
-
-# 2025-04-10T18:27:06 update
-
-# 2025-06-19T20:34:58 update
-
-# 2025-06-21T20:23:53 update
-
-# 2025-06-24T20:30:30 update
-
-# 2025-07-03T13:28:03 update
-
-# 2025-07-24T17:42:21 update
-
-# 2025-08-19T17:42:23 update
-
-# 2025-08-21T11:06:52 update
-
-# 2025-10-24T09:10:08 update
-
-# 2025-12-18T19:34:38 update
-
-# 2026-02-06T11:22:22 update
-
-# 2026-02-13T15:42:04 update
-
-# 2026-04-10T08:16:30 update
-
-# 2026-04-29T18:16:11 update
+# 2026-05-26T11:00:00 update — external ID uniqueness for service accounts (#4844)
