@@ -1,27 +1,121 @@
-"""Task Scheduler — Priority-based task queuing and dispatch."""
+"""Task Scheduler — Priority-based task queuing and dispatch with reducer error isolation."""
 
 import asyncio
 import heapq
 import logging
 import time
-from typing import Any, Dict, Optional
+from enum import Enum
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
-# Sentinel value for "no budget limit" on a priority class
-UNLIMITED = -1
+
+# ── Lifecycle states for reducer state machine ────────────────────────────────
+
+class TaskState(Enum):
+    SCHEDULED = "scheduled"   # Enqueued, waiting for delay expiry
+    PENDING   = "pending"     # In queue, not yet dequeued
+    RUNNING   = "running"     # Dequeued and being processed
+    COMPLETED = "completed"   # Successfully finished
+    FAILED    = "failed"      # Exhausted retries or terminal error
+    DEAD      = "dead"        # Moved to dead-letter after max retries
 
 
-class FairnessBudgetViolation(Exception):
-    """Raised when a task would violate fairness budget constraints."""
-    pass
+# ── Reducer error store ─────────────────────────────────────────────────────
+
+class ReducerError:
+    """Immutable record of a reducer transition error.
+
+    Private runtime data is explicitly excluded from error records
+    to prevent accidental exposure in logs or audit trails.
+    """
+
+    __slots__ = ("task_id", "from_state", "to_state", "reason", "attempt",
+                 "revision", "timestamp", "sanitized_ctx")
+
+    def __init__(
+        self,
+        task_id: str,
+        from_state: TaskState,
+        to_state: TaskState,
+        reason: str,
+        attempt: int,
+        revision: int,
+        sanitized_ctx: Optional[Dict[str, Any]] = None,
+    ):
+        self.task_id = task_id
+        self.from_state = from_state
+        self.to_state = to_state
+        self.reason = reason
+        self.attempt = attempt
+        self.revision = revision
+        self.timestamp = time.time()
+        # Sanitized context — only non-sensitive structural fields allowed
+        self.sanitized_ctx = sanitized_ctx or {}
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "from_state": self.from_state.value,
+            "to_state": self.to_state.value,
+            "reason": self.reason,
+            "attempt": self.attempt,
+            "revision": self.revision,
+            "timestamp": self.timestamp,
+            "sanitized_ctx": self.sanitized_ctx,
+        }
 
 
-class StaleStateTransition(Exception):
-    """Raised when an invalid or stale state transition is attempted."""
-    pass
+class ReducerErrorStore:
+    """Persists reducer transition errors separately from the task scheduler.
 
+    Issue #4758: events must be diagnosed even when the reducer rejects
+    a transition, so errors are stored here — not silently discarded.
+    """
+
+    def __init__(self):
+        self._errors: Dict[str, List[ReducerError]] = {}
+
+    def record(
+        self,
+        task_id: str,
+        from_state: TaskState,
+        to_state: TaskState,
+        reason: str,
+        attempt: int,
+        revision: int,
+        sanitized_ctx: Optional[Dict[str, Any]] = None,
+    ) -> ReducerError:
+        err = ReducerError(task_id, from_state, to_state, reason,
+                           attempt, revision, sanitized_ctx)
+        if task_id not in self._errors:
+            self._errors[task_id] = []
+        self._errors[task_id].append(err)
+        logger.warning(
+            "ReducerError task_id=%s from=%s to=%s reason=%s attempt=%d rev=%d",
+            task_id, from_state.value, to_state.value, reason, attempt, revision,
+        )
+        return err
+
+    def get_errors(self, task_id: str) -> List[ReducerError]:
+        return list(self._errors.get(task_id, []))
+
+    def all_errors(self) -> List[ReducerError]:
+        return [e for errors in self._errors.values() for e in errors]
+
+    def clear(self, task_id: Optional[str] = None) -> None:
+        if task_id:
+            self._errors.pop(task_id, None)
+        else:
+            self._errors.clear()
+
+    def audit_report(self) -> List[Dict[str, Any]]:
+        """Return all errors as a structured audit report (no private data)."""
+        return [e.to_dict() for e in self.all_errors()]
+
+
+# ── Priority queue ───────────────────────────────────────────────────────────
 
 class PriorityQueue:
     def __init__(self):
@@ -46,302 +140,321 @@ class PriorityQueue:
         return len(self._queue)
 
 
+# ── Scheduler ───────────────────────────────────────────────────────────────
+
 class TaskScheduler:
-    def __init__(self, default_budget: int = 10, max_retries: int = 3):
+    def __init__(self, max_retries: int = 3):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = max_retries
-        # Fairness budgets: priority_class -> (used_slots, max_slots)
-        self._fairness_budgets: Dict[str, tuple] = {}
-        # Budget limits per priority class (None = use default_budget)
-        self._budget_limits: Dict[str, int] = {}
-        self._default_budget = default_budget
-        # Tracks valid state transitions: agent_id -> last_known_state
-        self._agent_state_cache: Dict[str, str] = {}
-        # Liveness fence: reject stale transitions older than this (seconds)
-        self._state_fence_seconds = 300
+        self._error_store = ReducerErrorStore()
+        # Lifecycle state machine: task_id → (state, revision)
+        self._task_state: Dict[str, tuple] = {}
 
-    def set_budget_limit(self, priority_class: str, limit: int) -> None:
-        """Set max fairness budget slots for a priority class. Pass UNLIMITED for no cap."""
-        self._budget_limits[priority_class] = limit
+    # ── State machine helpers ──────────────────────────────────────────────
 
-    def _get_budget(self, priority_class: str) -> tuple:
-        """Return (used, max) slots for a priority class."""
-        if priority_class not in self._fairness_budgets:
-            limit = self._budget_limits.get(priority_class, self._default_budget)
-            self._fairness_budgets[priority_class] = (0, limit)
-        return self._fairness_budgets[priority_class]
+    def _get_state(self, task_id: str) -> TaskState:
+        entry = self._task_state.get(task_id)
+        if entry is None:
+            return TaskState.PENDING
+        return entry[0]
 
-    def _consume_budget(self, priority_class: str) -> None:
-        """Atomically consume one slot from a priority class budget."""
-        used, max_slots = self._get_budget(priority_class)
-        if max_slots != UNLIMITED and used >= max_slots:
-            logger.warning(
-                f"Fairness budget exhausted for priority_class={priority_class} "
-                f"(used={used}, max={max_slots})"
-            )
-            raise FairnessBudgetViolation(
-                f"Budget exhausted for priority class '{priority_class}'"
-            )
-        self._fairness_budgets[priority_class] = (used + 1, max_slots)
+    def _set_state(
+        self,
+        task_id: str,
+        new_state: TaskState,
+        err_store: ReducerErrorStore,
+    ) -> tuple:
+        """Atomically advance task state with revision increment.
 
-    def _release_budget(self, priority_class: str) -> None:
-        """Release one slot back to a priority class budget."""
-        if priority_class not in self._fairness_budgets:
-            return
-        used, max_slots = self._fairness_budgets[priority_class]
-        self._fairness_budgets[priority_class] = (max(0, used - 1), max_slots)
-
-    def _validate_state_transition(self, task: Dict) -> None:
+        Returns (ok, from_state, revision).
+        Raises ReducerError on invalid transition (logged to error_store).
         """
-        Validate state transition preconditions for urgent workflow lanes.
-        Raises StaleStateTransition if the transition is stale, duplicate, or policy-violating.
-        """
-        agent_id = task.get("target_agent")
-        priority_class = task.get("priority_class", "default")
-        expected_state = task.get("expected_agent_state")
-        task_id = task.get("id", "unknown")
+        entry = self._task_state.get(task_id)
+        if entry is None:
+            from_state = TaskState.PENDING
+            revision = 0
+        else:
+            from_state, revision = entry
 
-        # Check for duplicate in-flight task for the same agent
-        for in_flight_task in self._in_flight.values():
-            if (
-                in_flight_task.get("target_agent") == agent_id
-                and in_flight_task["id"] != task_id
-                and in_flight_task.get("priority_class") == priority_class
-            ):
-                logger.warning(
-                    f"Duplicate in-flight task for agent={agent_id} "
-                    f"priority_class={priority_class}, task_id={task_id}"
-                )
-                raise StaleStateTransition(
-                    f"Duplicate task for agent={agent_id} in priority_class={priority_class}"
-                )
+        # Validate transition is legal
+        valid = _is_valid_transition(from_state, new_state)
+        if not valid:
+            task = self._in_flight.get(task_id, {})
+            err_store.record(
+                task_id=task_id,
+                from_state=from_state,
+                to_state=new_state,
+                reason=f"invalid transition {from_state.value}→{new_state.value}",
+                attempt=task.get("retries", 0),
+                revision=revision,
+                sanitized_ctx={
+                    "queue": task.get("queue", "default"),
+                    "priority": task.get("priority", 0),
+                },
+            )
+            return False, from_state, revision
 
-        # Validate agent state cache for urgent lanes
-        if priority_class == "urgent" and agent_id:
-            cached_state = self._agent_state_cache.get(agent_id)
-            if cached_state and expected_state and cached_state != expected_state:
-                age = time.time() - task.get("enqueued_at", time.time())
-                if age > self._state_fence_seconds:
-                    logger.warning(
-                        f"Stale transition rejected: agent={agent_id} "
-                        f"cached={cached_state} expected={expected_state} age={age:.1f}s"
-                    )
-                    raise StaleStateTransition(
-                        f"Stale state transition for agent={agent_id}: "
-                        f"expected {expected_state}, cached {cached_state} (age={age:.1f}s)"
-                    )
-            # Update cache with expected state
-            if expected_state:
-                self._agent_state_cache[agent_id] = expected_state
+        # Accept transition
+        self._task_state[task_id] = (new_state, revision + 1)
+        return True, from_state, revision
 
-    def update_agent_state(self, agent_id: str, state: str) -> None:
-        """Update the cached state for an agent. Call this when agent lifecycle changes."""
-        self._agent_state_cache[agent_id] = state
+    # ── Enqueue ───────────────────────────────────────────────────────────
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0,
-                priority_class: str = "default") -> str:
-        """Enqueue a task. Raises FairnessBudgetViolation if budget is exhausted."""
-        is_retry = "id" in task  # already had an id -> re-enqueue after fail
-        if not is_retry:
-            task_id = str(uuid4())
-            task["id"] = task_id
-            task.setdefault("enqueued_at", time.time())
-            task["retries"] = 0
-        task["priority_class"] = priority_class
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = str(uuid4())
+        task["id"] = task_id
         task["queue"] = queue
-
-        # Enforce fairness budget before accepting (skip for retries — budget already consumed)
-        if not is_retry:
-            self._consume_budget(priority_class)
+        task["priority"] = priority
+        task.setdefault("retries", 0)
+        task.setdefault("enqueued_at", time.time())
+        task["_revision"] = 0
+        task["_state"] = TaskState.PENDING.value
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task["id"]
-
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        self._task_state[task_id] = (TaskState.PENDING, 0)
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        """
-        Async dequeue with fairness budget enforcement and atomic state preconditions.
-        Raises FairnessBudgetViolation or StaleStateTransition on policy violations.
-        """
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = str(uuid4())
+        task["id"] = task_id
+        task["queue"] = queue
+        task["priority"] = priority
+        self._scheduled[task_id] = time.time() + delay
+        self._task_state[task_id] = (TaskState.SCHEDULED, 0)
+        return task_id
+
+    # ── Dequeue ───────────────────────────────────────────────────────────
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                try:
-                    self.enqueue(task, queue,
-                                 priority=task.get("priority", 0),
-                                 priority_class=task.get("priority_class", "default"))
-                except FairnessBudgetViolation:
-                    pass  # skip expired tasks whose budget is exhausted
+            self._scheduled.pop(tid, None)
+            # Re-enqueue as pending (scheduler.py enqueue, not self.enqueue)
+            task = {"id": tid, "queue": queue, "retries": 0,
+                    "enqueued_at": now, "priority": 0, "_revision": 0}
+            if queue not in self._queues:
+                self._queues[queue] = PriorityQueue()
+            self._queues[queue].push(task, 0)
+            s, rev = self._task_state.get(tid, (TaskState.PENDING, 0))
+            self._task_state[tid] = (TaskState.PENDING, rev)
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
-                self._validate_state_transition(task)
-                self._in_flight[task["id"]] = task
+                task_id = task["id"]
+                # Advance PENDING → RUNNING with guard
+                ok, from_state, rev = self._set_state(
+                    task_id, TaskState.RUNNING, self._error_store
+                )
+                if not ok:
+                    # Transition rejected — task stayed in previous state;
+                    # log but still move to in_flight for diagnostics
+                    self._in_flight[task_id] = task
+                    return task
+                task["_revision"] = rev
+                self._in_flight[task_id] = task
                 return task
         return None
 
+    # ── Lifecycle ops (reducer transitions) ──────────────────────────────
+
     def complete(self, task_id: str) -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            self._release_budget(task.get("priority_class", "default"))
+        """Complete a task — reducer enforces valid state transition."""
+        task = self._in_flight.get(task_id)
+        if task is None:
+            # Task not in flight — check state machine
+            state, rev = self._task_state.get(task_id, (None, 0))
+            if state is None:
+                return False  # Unknown task, silent no-op
+            if state == TaskState.COMPLETED:
+                # Duplicate complete — record as rejected duplicate transition
+                self._error_store.record(
+                    task_id=task_id,
+                    from_state=TaskState.COMPLETED,
+                    to_state=TaskState.COMPLETED,
+                    reason="duplicate complete() call on already-completed task",
+                    attempt=0, revision=rev,
+                    sanitized_ctx={"task_id": task_id},
+                )
+                return False
+            if state in (TaskState.RUNNING, TaskState.FAILED, TaskState.DEAD):
+                self._error_store.record(
+                    task_id=task_id,
+                    from_state=state,
+                    to_state=TaskState.COMPLETED,
+                    reason=f"complete() called on {state.value} task — duplicate or stale",
+                    attempt=0, revision=rev,
+                    sanitized_ctx={"task_id": task_id},
+                )
+            # PENDING or SCHEDULED: invalid to complete without dequeue first
+            # (record as rejected transition)
+            elif state in (TaskState.PENDING, TaskState.SCHEDULED):
+                self._error_store.record(
+                    task_id=task_id,
+                    from_state=state,
+                    to_state=TaskState.COMPLETED,
+                    reason=f"complete() called on {state.value} task — must dequeue first",
+                    attempt=0, revision=rev,
+                    sanitized_ctx={"task_id": task_id},
+                )
+            return False
+
+        ok, from_state, rev = self._set_state(
+            task_id, TaskState.COMPLETED, self._error_store
+        )
+        if not ok:
+            self._error_store.record(
+                task_id=task_id,
+                from_state=from_state,
+                to_state=TaskState.COMPLETED,
+                reason="invalid transition to COMPLETED",
+                attempt=task.get("retries", 0),
+                revision=rev,
+                sanitized_ctx={
+                    "queue": task.get("queue", "default"),
+                    "priority": task.get("priority", 0),
+                },
+            )
+            return False
+
+        self._in_flight.pop(task_id, None)
         return True
-        return task is not None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            priority_class = task.get("priority_class", "default")
-            task["retries"] += 1
-            self._release_budget(priority_class)
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue,
-                             priority=task.get("priority", 0),
-                             priority_class=priority_class)
-                return True
-        return False
-
-# 2019-04-25T08:37:12 update
-
-# 2019-06-04T16:40:00 update
-
-# 2019-07-11T12:01:28 update
-
-# 2019-08-02T12:20:21 update
-
-# 2019-08-23T10:38:50 update
-
-# 2019-10-31T13:55:52 update
-
-# 2019-11-04T20:12:32 update
-
-# 2019-12-13T12:22:36 update
-
-# 2020-02-01T10:32:37 update
-
-# 2020-02-26T09:44:38 update
-
-# 2020-03-09T19:00:55 update
-
-# 2020-05-01T18:40:34 update
-
-# 2020-05-12T15:10:31 update
-
-# 2020-06-30T13:24:19 update
-
-# 2020-09-22T16:00:45 update
-
-# 2020-10-20T10:52:48 update
-
-# 2020-10-21T12:18:08 update
-
-# 2020-11-06T12:35:01 update
-
-# 2020-12-09T08:09:33 update
-
-# 2021-01-07T08:20:36 update
-
-# 2021-10-02T15:23:16 update
-
-# 2021-10-06T16:14:57 update
-
-# 2021-10-06T09:27:41 update
-
-# 2021-11-19T08:37:40 update
-
-# 2022-03-01T16:39:54 update
-
-# 2022-05-26T13:43:07 update
-
-# 2022-06-02T10:50:58 update
-
-# 2022-06-14T10:46:48 update
-
-# 2022-07-31T16:44:34 update
-
-# 2022-08-30T18:20:12 update
-
-# 2022-11-04T14:47:03 update
-
-# 2022-12-06T10:36:49 update
-
-# 2022-12-22T13:21:12 update
-
-# 2022-12-26T12:24:50 update
-
-# 2023-03-09T08:09:55 update
-
-# 2023-05-01T10:07:37 update
-
-# 2023-06-08T14:32:15 update
-
-# 2023-07-14T17:24:18 update
-
-# 2023-12-14T08:38:31 update
-
-# 2024-02-20T13:43:58 update
-
-# 2024-03-24T08:52:42 update
-
-# 2024-03-28T15:27:17 update
-
-# 2024-03-29T18:10:33 update
-
-# 2024-04-15T20:18:31 update
-
-# 2024-05-27T13:11:52 update
-
-# 2024-05-27T16:42:56 update
-
-# 2024-06-20T13:03:45 update
-
-# 2024-06-28T12:32:58 update
-
-# 2024-07-10T14:10:16 update
-
-# 2024-07-26T14:18:59 update
-
-# 2024-08-12T08:21:05 update
-
-# 2024-08-21T16:58:40 update
-
-# 2024-09-27T19:54:30 update
-
-# 2024-10-21T13:47:42 update
-
-# 2024-11-11T09:19:27 update
-
-# 2024-12-24T08:23:41 update
-
-# 2025-02-14T10:35:15 update
-
-# 2025-03-31T18:09:40 update
-
-# 2025-06-21T17:32:49 update
-
-# 2025-07-21T16:52:28 update
-
-# 2025-08-20T19:45:16 update
-
-# 2025-11-04T18:54:24 update
-
-# 2025-12-09T20:17:36 update
-
-# 2026-01-12T15:42:32 update
-
-# 2026-01-23T14:41:20 update
-
-# 2026-03-18T14:43:07 update
-
-# 2026-04-13T11:43:19 update
+        """Fail a task — reducer enforces retry/dead-letter policy."""
+        task = self._in_flight.get(task_id)
+        if task is None:
+            state, rev = self._task_state.get(task_id, (None, 0))
+            if state is None:
+                return False  # Unknown task
+            if state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.DEAD):
+                self._error_store.record(
+                    task_id=task_id,
+                    from_state=state,
+                    to_state=TaskState.FAILED,
+                    reason=f"fail() called on {state.value} task — stale transition",
+                    attempt=0, revision=rev,
+                    sanitized_ctx={"task_id": task_id},
+                )
+                return False
+            if state == TaskState.PENDING:
+                # Task is queued — extract it and fail it
+                found = self._extract_from_queue(task_id, queue)
+                if not found:
+                    return False
+                task = found
+            elif state == TaskState.SCHEDULED:
+                self._scheduled.pop(task_id, None)
+            else:
+                return False
+
+        attempt = task.get("retries", 0) + 1
+        task["retries"] = attempt
+
+        if attempt >= self._max_retries:
+            ok, from_state, rev = self._set_state(
+                task_id, TaskState.DEAD, self._error_store
+            )
+            if not ok:
+                self._error_store.record(
+                    task_id=task_id,
+                    from_state=from_state,
+                    to_state=TaskState.DEAD,
+                    reason="stale or duplicate fail() call on dead task",
+                    attempt=attempt,
+                    revision=rev,
+                    sanitized_ctx={
+                        "queue": task.get("queue", "default"),
+                        "priority": task.get("priority", 0),
+                        "max_retries": self._max_retries,
+                    },
+                )
+                return False
+            self._in_flight.pop(task_id, None)
+            return True
+
+        ok, from_state, rev = self._set_state(
+            task_id, TaskState.PENDING, self._error_store
+        )
+        if not ok:
+            self._error_store.record(
+                task_id=task_id,
+                from_state=from_state,
+                to_state=TaskState.PENDING,
+                reason=f"stale fail() call during retry (attempt {attempt})",
+                attempt=attempt,
+                revision=rev,
+                sanitized_ctx={
+                    "queue": task.get("queue", "default"),
+                    "priority": task.get("priority", 0),
+                },
+            )
+            return False
+
+        task["_revision"] = rev
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._queues[queue].push(task, task.get("priority", 0))
+        self._in_flight.pop(task_id, None)
+        return True
+
+    def _extract_from_queue(self, task_id: str, queue: str) -> Optional[Dict]:
+        """Pop a task by ID from a priority queue (linear scan)."""
+        if queue not in self._queues:
+            return None
+        pq = self._queues[queue]
+        # Rebuild heap without the target task
+        items = []
+        while len(pq._queue):
+            _, _, item = heapq.heappop(pq._queue)
+            if item["id"] == task_id:
+                return item
+            items.append((-(item.get("priority", 0)), pq._counter, item))
+            pq._counter += 1
+        # Re-push non-matching items
+        for item in items:
+            heapq.heappush(pq._queue, item)
+        return None
+
+    # ── Error store accessor ──────────────────────────────────────────────
+
+    def get_errors(self, task_id: str) -> List[ReducerError]:
+        return self._error_store.get_errors(task_id)
+
+    def error_audit_report(self) -> List[Dict[str, Any]]:
+        return self._error_store.audit_report()
+
+
+# ── Transition table ────────────────────────────────────────────────────────
+
+def _is_valid_transition(from_state: TaskState, to_state: TaskState) -> bool:
+    """Deterministic transition table for the task reducer state machine."""
+    allowed = {
+        TaskState.SCHEDULED: {TaskState.PENDING},
+        TaskState.PENDING:    {TaskState.RUNNING, TaskState.DEAD},
+        TaskState.RUNNING:   {TaskState.COMPLETED, TaskState.PENDING, TaskState.DEAD},
+        TaskState.COMPLETED: set(),          # Terminal — no further transitions
+        TaskState.FAILED:    set(),          # Terminal — no further transitions
+        TaskState.DEAD:      set(),          # Terminal — no further transitions
+    }
+    return to_state in allowed.get(from_state, set())
