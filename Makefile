@@ -24,10 +24,16 @@ docker-build:
 	docker compose -f infra/docker-compose.yml build
 
 docker-up:
-	docker compose -f infra/docker-compose.yml up -d
+	docker compose -f infra/docker-compose.yml --profile default up -d
 
 docker-down:
-	docker compose -f infra/docker-compose.yml down
+	docker compose -f infra/docker-compose.yml --profile default down
+
+docker-builder-up:
+	docker compose -f infra/docker-compose.yml --profile builder up -d builder
+
+docker-builder-down:
+	docker compose -f infra/docker-compose.yml --profile builder down
 
 # 2019-01-15T19:25:56 update
 

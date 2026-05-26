@@ -1,0 +1,108 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+      target: prod
+    image: agent-orchestrator:latest
+    container_name: ao-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - AO_REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - AO_DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/ao}
+      - AO_LOG_LEVEL=${LOG_LEVEL:-INFO}
+    env_file:
+      - ../.env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - ""
+      - default
+
+  worker:
+    image: agent-orchestrator:latest
+    container_name: ao-worker
+    command: ["ao", "worker", "--concurrency", "${WORKER_CONCURRENCY:-2}"]
+    environment:
+      - AO_REDIS_URL=${REDIS_URL:-redis://redis://redis:6379/0}
+      - AO_DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/ao}
+      - AO_LOG_LEVEL=${LOG_LEVEL:-INFO}
+    env_file:
+      - ../.env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - ""
+      - default
+
+  redis:
+    image: redis:7-alpine
+    container_name: ao-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - ""
+      - default
+      - builder
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ao-postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-ao}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - ""
+      - default
+      - builder
+
+  builder:
+    image: agent-orchestrator:latest
+    container_name: ao-builder
+    command: ["sleep", "infinity"]
+    environment:
+      - AO_REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - AO_DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/ao}
+      - AO_LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - builder
+
+volumes:
+  redis_data:
+  postgres_data:
