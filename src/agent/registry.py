@@ -60,6 +60,19 @@ class AuthContext:
 _revoked_credentials: Dict[str, float] = {}  # credential_id -> revocation_timestamp
 
 
+def _normalize_agent_id(agent_id: str) -> str:
+    """Normalize an agent ID to canonical form.
+
+    Converts mixed-case identifiers to lower-case so that lookups
+    are case-insensitive. This prevents clients from bypassing
+    authorization checks by using different capitalisation of the
+    same ID.
+    """
+    if not isinstance(agent_id, str):
+        raise ValueError(f"agent_id must be a string, got {type(agent_id).__name__}")
+    return agent_id.lower()
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
@@ -137,6 +150,7 @@ class AgentRegistry:
     # ── Reads ─────────────────────────────────────────────────────────────────
 
     def get(self, agent_id: str, auth: Optional[AuthContext] = None) -> Optional[Dict[str, Any]]:
+        agent_id = _normalize_agent_id(agent_id)
         if auth is not None:
             self._check_membership(auth, agent_id)
         return self._agents.get(agent_id)
@@ -168,6 +182,7 @@ class AgentRegistry:
     def update_status(
         self, agent_id: str, status: AgentStatus, auth: Optional[AuthContext] = None
     ) -> bool:
+        agent_id = _normalize_agent_id(agent_id)
         if auth is not None:
             self._check_membership(auth, agent_id, require_mutate=True)
         if agent_id not in self._agents:
@@ -177,6 +192,7 @@ class AgentRegistry:
         return True
 
     def delete(self, agent_id: str, auth: Optional[AuthContext] = None) -> bool:
+        agent_id = _normalize_agent_id(agent_id)
         if auth is not None:
             self._check_membership(auth, agent_id, require_mutate=True)
         if agent_id not in self._agents:
