@@ -1,7 +1,7 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 from uuid import uuid4
 
 
@@ -11,6 +11,92 @@ class StepStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+
+
+class DuplicateAliasError(ValueError):
+    """Raised when duplicate parameter aliases are detected in workflow API inputs."""
+
+    def __init__(self, duplicates: List[str]):
+        self.duplicates = duplicates
+        super().__init__(
+            f"Duplicate parameter aliases detected: {', '.join(duplicates)}. "
+            "Each alias must be unique across all workflow parameters."
+        )
+
+
+class WorkflowParameter:
+    """Defines a single input parameter for a workflow, with optional aliases."""
+
+    def __init__(
+        self,
+        name: str,
+        param_type: str = "string",
+        required: bool = False,
+        default: Any = None,
+        aliases: Optional[List[str]] = None,
+    ):
+        self.name = name
+        self.param_type = param_type
+        self.required = required
+        self.default = default
+        self.aliases = aliases or []
+
+
+class WorkflowInputSchema:
+    """Schema for workflow input parameters with alias deduplication validation."""
+
+    def __init__(self):
+        self._parameters: Dict[str, WorkflowParameter] = {}
+
+    def add_parameter(self, param: WorkflowParameter) -> None:
+        self._parameters[param.name] = param
+
+    def validate(self) -> None:
+        """Validate workflow parameter aliases — rejects duplicate aliases.
+
+        Iterates all parameters and their aliases, ensuring no alias appears
+        more than once (including as another parameter's primary name).
+
+        Raises:
+            DuplicateAliasError: If any duplicate alias is found.
+        """
+        seen: Dict[str, str] = {}
+        duplicates: Set[str] = set()
+
+        # Check primary parameter names first
+        for param_name in self._parameters:
+            if param_name in seen:
+                duplicates.add(param_name)
+            else:
+                seen[param_name] = param_name
+
+        # Check all aliases against each other and against primary names
+        for param_name, param in self._parameters.items():
+            for alias in param.aliases:
+                if alias in seen and seen[alias] != param_name:
+                    duplicates.add(alias)
+                elif alias == param_name:
+                    duplicates.add(alias)
+                else:
+                    seen[alias] = param_name
+
+        if duplicates:
+            raise DuplicateAliasError(sorted(duplicates))
+
+    def to_dict(self) -> Dict:
+        return {
+            name: {
+                "type": p.param_type,
+                "required": p.required,
+                "default": p.default,
+                "aliases": p.aliases,
+            }
+            for name, p in self._parameters.items()
+        }
+
+    @property
+    def parameters(self) -> Dict[str, WorkflowParameter]:
+        return self._parameters
 
 
 class WorkflowStep:
@@ -33,6 +119,7 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.input_schema: Optional[WorkflowInputSchema] = None
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -41,6 +128,11 @@ class Workflow:
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def set_input_schema(self, schema: WorkflowInputSchema) -> "Workflow":
+        schema.validate()
+        self.input_schema = schema
+        return self
 
 
 class WorkflowManager:
@@ -61,10 +153,29 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def register_workflow(self, workflow: Workflow) -> str:
+        """Register a workflow with validation before binding.
+
+        Validation runs against the workflow's input_schema (if present)
+        to reject duplicate parameter aliases before the workflow can be
+        dispatched or executed.
+
+        Raises:
+            DuplicateAliasError: If duplicate parameter aliases are detected.
+        """
+        if workflow.input_schema is not None:
+            workflow.input_schema.validate()
+        self._workflows[workflow.id] = workflow
+        return workflow.id
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
+
+        # Enforce validation before execution
+        if workflow.input_schema is not None:
+            workflow.input_schema.validate()
 
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:

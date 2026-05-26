@@ -2,7 +2,7 @@
 
 import os
 import tempfile
-import resource
+import sys
 from typing import Dict, Optional
 from pathlib import Path
 
@@ -37,11 +37,16 @@ class AgentSandbox:
         return self._sandboxes.get(agent_id)
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
+        # resource module is not available on Windows
+        # This is a no-op for Windows compatibility
+        if sys.platform == "win32":
+            return
         try:
+            import resource
             resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+        except (ImportError, ValueError, resource.error) as e:
             pass
 
     def cleanup_all(self) -> None:
